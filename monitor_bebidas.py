@@ -2,7 +2,7 @@
 """
 Monitor de promoções de BEBIDAS ALCOÓLICAS - região de Joinville/SC
 
-Fontes ativas: Amazon, Angeloni e Tiendeo (Joinville). Novas fontes podem ser adicionadas no config.json.
+Fontes ativas: Amazon, Giassi, Bistek, Angeloni e Tiendeo (Joinville). Novas fontes podem ser adicionadas no config.json.
 
 O que faz:
   1. Busca cada termo (cerveja, vinho, whisky...) nas lojas configuradas
@@ -24,7 +24,7 @@ Uso:
   python monitor_bebidas.py --sem-navegador               # usa só requests
   python monitor_bebidas.py --html pagina.html --parser mercadolivre   # testa um HTML salvo
   python monitor_bebidas.py --pdf encarte.pdf             # testa a leitura de um PDF do Fort
-  python monitor_bebidas.py --login                       # entra uma vez na sua conta do Mercado Livre
+  python monitor_bebidas.py --login giassi                # escolhe a loja de Joinville (1 vez); idem: bistek
 
 Agendamento diário:
   Linux/Mac (cron):   0 8 * * *  /usr/bin/python3 /caminho/monitor_bebidas.py --sem-pausa
@@ -53,7 +53,7 @@ from bs4 import BeautifulSoup
 
 BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 ARQ_CONFIG = BASE_DIR / "config.json"
-VERSAO_CONFIG = 4
+VERSAO_CONFIG = 5
 
 CONFIG_PADRAO = {
     "versao_config": VERSAO_CONFIG,
@@ -70,11 +70,24 @@ CONFIG_PADRAO = {
     # Salva o HTML de páginas que retornaram 0 itens em saida_bebidas/debug/
     "salvar_html_debug": True,
     "termos_busca": ["cerveja", "vinho", "espumante", "whisky", "vodka", "gin", "cachaça", "tequila"],
-    # tipo: amazon | jsonld  (os tipos mercadolivre e fort_pdf ainda existem no código,
-    # mas estão desativados por padrão; veja o histórico da conversa se quiser reativar)
+    # tipo: amazon | vtex_html | jsonld  (os tipos mercadolivre e fort_pdf ainda existem
+    # no código, mas estão desativados por padrão)
+    # Campos opcionais: "termos" (lista própria de buscas) e "max_paginas" (paginação).
     "fontes": [
         {"nome": "Amazon", "tipo": "amazon",
          "url_modelo": "https://www.amazon.com.br/s?k={termo}"},
+        # --- Giassi (loja VTEX). Preços dependem da loja: rode --login giassi uma vez ---
+        {"nome": "Giassi - Cervejas", "tipo": "vtex_html", "max_paginas": 4,
+         "url": "https://www.giassi.com.br/bebidas-alcoolicas/cervejas"},
+        {"nome": "Giassi - Busca", "tipo": "vtex_html", "max_paginas": 2,
+         "termos": ["vinho", "espumante", "whisky", "vodka", "gin", "cachaça", "tequila"],
+         "url_modelo": "https://www.giassi.com.br/{termo}?_q={termo}&map=ft"},
+        # --- Bistek. Preços dependem da loja/CEP: rode --login bistek uma vez ---
+        {"nome": "Bistek - Cervejas", "tipo": "vtex_html", "max_paginas": 4,
+         "url": "https://www.bistek.com.br/bebidas/cervejas?map=category-1,category-2"},
+        {"nome": "Bistek - Busca", "tipo": "vtex_html", "max_paginas": 2,
+         "termos": ["vinho", "espumante", "whisky", "vodka", "gin", "cachaça", "tequila"],
+         "url_modelo": "https://www.bistek.com.br/{termo}?_q={termo}&map=ft"},
         {"nome": "Angeloni - Black Friday Bebidas", "tipo": "jsonld",
          "url": "https://super.angeloni.com.br/black-friday-em-bebidas"},
         {"nome": "Tiendeo - Cerveja Joinville", "tipo": "jsonld",
@@ -268,6 +281,11 @@ class Navegador:
                 continue
         if self._ctx is None:
             raise RuntimeError("Nenhum navegador encontrado. Instale o Microsoft Edge ou o Google Chrome.")
+        for arq in BASE_DIR.glob("sessao_*.json"):         # loja escolhida via --login <site>
+            try:
+                self._ctx.add_cookies(json.loads(arq.read_text(encoding="utf-8")).get("cookies", []))
+            except Exception as e:
+                print(f"Aviso: não consegui carregar {arq.name}: {str(e)[:60]}")
         return self
 
     def __exit__(self, *exc):
@@ -532,7 +550,13 @@ def parse_amazon(html: str):
     return itens or parse_generico(html)
 
 
-PARSERS = {"mercadolivre": parse_mercadolivre, "amazon": parse_amazon, "jsonld": parse_generico}
+def parse_vtex_html(html: str):
+    """Lojas VTEX (Giassi, Bistek): usa só os dados estruturados (JSON-LD) das páginas."""
+    return extrair_jsonld(html)
+
+
+PARSERS = {"mercadolivre": parse_mercadolivre, "amazon": parse_amazon, "jsonld": parse_generico,
+           "vtex_html": parse_vtex_html}
 
 
 # ----------------------------------------------------------------------
@@ -785,6 +809,13 @@ def coletar_fort_pdf(fonte: dict, nav: Navegador):
 # COLETA
 # ----------------------------------------------------------------------
 
+def _url_pagina(url: str, n: int) -> str:
+    """Acrescenta ?page=N (ou &page=N) a partir da 2ª página."""
+    if n <= 1:
+        return url
+    return url + ("&" if "?" in url else "?") + f"page={n}"
+
+
 def montar_tarefas(termos):
     """Expande as fontes em uma lista de (fonte, termo, url)."""
     tarefas = []
@@ -792,9 +823,9 @@ def montar_tarefas(termos):
         if f.get("tipo") == "fort_pdf":
             tarefas.append((f, "", f.get("base_url", "")))
         elif "url_modelo" in f:
-            for termo in termos:
-                if f.get("tipo") == "mercadolivre":
-                    t = sem_acento(termo).strip().replace(" ", "-")
+            for termo in f.get("termos", termos):
+                if f.get("tipo") in ("mercadolivre", "vtex_html"):
+                    t = sem_acento(termo).strip().replace(" ", "-")      # sem acento na URL
                 else:
                     t = quote_plus(termo)
                 tarefas.append((f, termo, f["url_modelo"].format(termo=t)))
@@ -824,11 +855,23 @@ def coletar(fonte: dict, termo: str, url: str, nav: Navegador):
             itens = coletar_fort_pdf(fonte, nav)
         else:
             parser = PARSERS.get(tipo, parse_generico)
-            html = nav.html(url, validar=lambda h: bool(parser(h)))
-            itens = parser(html)
+            itens, vistos = [], set()
+            for n in range(1, int(fonte.get("max_paginas", 1)) + 1):
+                # só a 1ª página espera captcha/login; as seguintes apenas encerram quando vazias
+                html = nav.html(_url_pagina(url, n),
+                                validar=(lambda h: bool(parser(h))) if n == 1 else None)
+                novos = [it for it in parser(html) if (it["produto"], it["preco"]) not in vistos]
+                if not novos:
+                    break
+                vistos.update((it["produto"], it["preco"]) for it in novos)
+                itens.extend(novos)
+                if int(fonte.get("max_paginas", 1)) > 1:
+                    print(f"   página {n}: {len(novos)} itens")
+                if n < int(fonte.get("max_paginas", 1)):
+                    time.sleep(PAUSA_ENTRE_PAGINAS_S)
             if not itens and re.search(r"login|registration|verification", getattr(nav, "ultima_url", "")):
-                print("   O site pediu login. Rode uma vez  monitor_bebidas.exe --login  "
-                      "(ou o login_mercadolivre.bat), entre na SUA conta e confirme; a sessão fica salva.")
+                print("   O site pediu login. Rode uma vez  python monitor_bebidas.py --login <site>  "
+                      "(giassi, bistek, mercadolivre ou amazon), entre na SUA conta e confirme.")
             elif not itens and pagina_bloqueada(html):
                 print("   BLOQUEADO (captcha/verificação). Mantenha \"mostrar_navegador\": true e resolva na janela.")
     except Exception as e:
@@ -843,6 +886,8 @@ def coletar(fonte: dict, termo: str, url: str, nav: Navegador):
         it["fonte"] = fonte["nome"]
         it["termo"] = termo
         it["coletado_em"] = agora
+        if not it.get("link"):
+            it["link"] = url
         if it.get("link", "").startswith("/"):
             base = re.match(r"https?://[^/]+", url)
             it["link"] = (base.group(0) if base else "") + it["link"]
@@ -911,18 +956,27 @@ def salvar_excel(caminho, df, alertas):
 SITES_LOGIN = {
     "mercadolivre": "https://www.mercadolivre.com.br/",
     "amazon": "https://www.amazon.com.br/",
+    "giassi": "https://www.giassi.com.br/",
+    "bistek": "https://www.bistek.com.br/",
 }
+SITES_COM_LOJA = ("giassi", "bistek")
 
 
 def login_manual(site: str):
-    """Abre o navegador com o perfil do programa para você entrar na SUA conta.
-    A sessão fica salva em perfil_navegador/ e é reutilizada nas próximas execuções."""
-    print(f"Abrindo {site}. Faça login com a sua conta na janela que vai aparecer.")
+    """Abre o navegador com o perfil do programa para você entrar na SUA conta e/ou
+    escolher a loja. Os cookies ficam em sessao_<site>.json e perfil_navegador/."""
+    if site in SITES_COM_LOJA:
+        print(f"Abrindo {site}. Na janela: (1) faça login com a sua conta, se o site pedir, e "
+              f"(2) escolha a LOJA ou informe o CEP de Joinville.")
+    else:
+        print(f"Abrindo {site}. Faça login com a sua conta na janela que vai aparecer.")
     with Navegador(True, visivel=True, espera_s=0) as nav:
         pagina = nav._ctx.new_page()
         pagina.goto(SITES_LOGIN[site], timeout=60000)
-        input("\nDepois de entrar na sua conta, volte aqui e pressione Enter para salvar a sessão...")
-    print("Sessão salva. Agora rode o programa normalmente.")
+        input("\nQuando terminar, volte aqui e pressione Enter para salvar a sessão...")
+        nav._ctx.storage_state(path=str(BASE_DIR / f"sessao_{site}.json"))
+    print(f"Sessão salva em sessao_{site}.json. Esse arquivo contém seus cookies: não o compartilhe.")
+    print("Agora rode o programa normalmente.")
 
 
 def diagnostico(args):
@@ -951,12 +1005,17 @@ def main():
     ap.add_argument("--html", help="testa a extração em um arquivo HTML salvo")
     ap.add_argument("--parser", default="jsonld", choices=list(PARSERS), help="parser para --html")
     ap.add_argument("--pdf", help="testa a leitura de um PDF de encarte do Fort")
-    ap.add_argument("--login", nargs="?", const="mercadolivre", choices=list(SITES_LOGIN),
-                    help="abre o navegador para você entrar na sua conta (padrão: mercadolivre)")
+    ap.add_argument("--login", "--loja", dest="login", choices=list(SITES_LOGIN),
+                    help="abre o navegador para você entrar na conta / escolher a loja de Joinville "
+                         "(giassi, bistek, mercadolivre, amazon)")
     args = ap.parse_args()
 
     if args.login:
-        return login_manual(args.login)
+        try:
+            return login_manual(args.login)
+        except RuntimeError as e:
+            print(f"ERRO: {e}")
+            return
 
     if args.html or args.pdf:
         return diagnostico(args)
